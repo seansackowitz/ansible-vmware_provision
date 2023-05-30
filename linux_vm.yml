@@ -1,0 +1,121 @@
+---
+- hosts: all
+  connection: local
+  collections:
+    - vmware.vmware_rest
+  vars:
+    vcenter_config_parent_folder: LabFolder
+    vcenter_config_cluster: MyCluster
+    vcenter_config_datastore: vsanDatastore
+    vcenter_config_template: RHEL9_Gold
+    vm_vars: |
+      - name: aap
+        cpu: 4
+        mem: 16
+      - name: aap-hub
+        cpu: 4
+        mem: 16
+      - name: aap-db
+        cpu: 4
+        mem: 16
+  tasks:
+    - name: Gather Cluster id
+      vmware.vmware_rest.vcenter_cluster_info:
+        filter_names:
+          - "{{ vcenter_config_cluster }}"
+      register: cluster_id
+
+    - name: Gather Datastore id
+      vmware.vmware_rest.vcenter_datastore_info:
+        filter_names:
+          - "{{ vcenter_config_datastore }}"
+      register: datastore_id
+
+    - name: Gather Template VM id
+      vmware.vmware_rest.vcenter_vm_info:
+        filter_names:
+          - "{{ vcenter_config_template }}"
+      register: template_vm
+
+    - set_fact:
+        vm_folder: "{{ vcenter_config_parent_folder }}"
+      when: vcenter_config_parent_folder is defined
+
+    - name: Gather Folder id
+      vmware.vmware_rest.vcenter_folder_info:
+        filter_names:
+          - "{{ vm_folder }}"
+      register: vm_folder_id
+
+    - name: Create all VMs
+      vmware.vmware_rest.vcenter_vm:
+        placement:
+          cluster: "{{ cluster_id.value[0].cluster }}"
+          folder: "{% if vm_folder %}{{ vm_folder_id.value[0].folder }}{% else %}{{ omit }}{% endif %}"
+          datastore: "{{ datastore_id.value[0].datastore }}"
+        source: "{{ template_vm.value[0].vm }}"
+        guest_customization_spec:
+          name: "RHEL8"
+        guest_OS: RHEL_9_64
+        name: "{{ item.name }}"
+        state: clone
+      loop: "{{ vm_vars | from_yaml }}"
+      register: create_vms_status
+      async: 600
+      poll: 0
+      vars:
+        ansible_async_dir: '/tmp/.ansible_async'
+
+    - name: Wait for all VMs to be created
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: _jobs_create
+      until: _jobs_create.finished
+      delay: 5
+      retries: 60
+      with_items: "{{ create_vms_status.results }}"
+      vars:
+        ansible_async_dir: '/tmp/.ansible_async'
+
+    - name: Update all VM CPUs
+      vmware.vmware_rest.vcenter_vm_hardware_cpu:
+        vm: "{{ item.id }}"
+        count: "{{ item.item.item.cpu }}"
+      loop: "{{ _jobs_create.results }}"
+      register: update_cpu_status
+
+    - name: Update all VM Memory
+      vmware.vmware_rest.vcenter_vm_hardware_memory:
+        vm: "{{ item.id }}"
+        size_MiB: "{{ item.item.item.mem * 1024 }}"
+      loop: "{{ _jobs_create.results }}"
+      register: update_mem_status
+
+    - name: Power on all VMs
+      vmware.vmware_rest.vcenter_vm_power:
+        state: start
+        vm: '{{ item.id }}'
+      loop: "{{ _jobs_create.results }}"
+      register: update_mem_status
+
+    - name: add hosts to inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}.example.com"
+        groups: "new_vms"
+      loop: "{{ vm_vars | from_yaml }}"
+
+- name: Ensure hosts are online
+  gather_facts: false
+  hosts: new_vms
+  tasks:
+    - name: Wait for system to become reachable
+      ansible.builtin.wait_for_connection:
+    
+    - ansible.builtin.setup:
+
+    - ansible.builtin.set_stats:
+        data:
+          new_vms:
+            - host: "{{ inventory_hostname }}"
+              address: "{{ ansible_default_ipv4.address }}"
+...
